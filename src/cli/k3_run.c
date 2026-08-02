@@ -383,7 +383,7 @@ int main(int argc, char **argv)
     const char *logits_path = NULL;
     const char *prompt_text = NULL, *prompt_file = NULL, *tok_dir = NULL;
     const char *cfg_path = NULL;
-    int gen = 8, want_layers = -1, topk_override = 0;
+    int gen = 8, want_layers = -1, topk_override = 0, topk_zero = 0;
     double cache_gb = 64.0, trunk_gb = 16.0;
     const char *preset_name = NULL;
     int incremental = 0, use_cuda = 0, layer_spacing = 0;
@@ -402,7 +402,10 @@ int main(int argc, char **argv)
         else if (!strcmp(argv[i], "--trunk-gb") && i + 1 < argc) trunk_gb = atof(argv[++i]);
         else if (!strcmp(argv[i], "--incremental")) incremental = 1;
         else if (!strcmp(argv[i], "--cuda")) use_cuda = 1;
-        else if (!strcmp(argv[i], "--topk") && i + 1 < argc) topk_override = atoi(argv[++i]);
+        else if (!strcmp(argv[i], "--topk") && i + 1 < argc) {
+            topk_override = atoi(argv[++i]);
+            topk_zero = topk_override == 0;   /* 0 is a value, not "unset" */
+        }
         else if (!strcmp(argv[i], "--dump-logits") && i + 1 < argc) logits_path = argv[++i];
         else if (!strcmp(argv[i], "--dump-cache-trace") && i + 1 < argc) trace_dir = argv[++i];
         else if (!strcmp(argv[i], "--preset") && i + 1 < argc) {
@@ -447,12 +450,16 @@ int main(int argc, char **argv)
         fprintf(stderr, "ABORTED: the model config could not be read with confidence.\n");
         return 2;
     }
-    if (topk_override) {
-        if (topk_override < 1 || topk_override > c.topk) {
-            fprintf(stderr, "--topk must be between 1 and the checkpoint value %d\n", c.topk);
+    if (topk_override || topk_zero) {
+        if (topk_override < 0 || topk_override > c.topk) {
+            fprintf(stderr, "--topk must be between 0 and the checkpoint value %d\n",
+                    c.topk);
             return 2;
         }
-        if (topk_override != c.topk)
+        if (topk_override == 0)
+            printf("NOTE: routed experts DISABLED (--topk 0). Shared experts only. "
+                   "This is a different model, not a faster Kimi K3.\n\n");
+        else if (topk_override != c.topk)
             printf("NOTE: routed top-k reduced from %d to %d. This MODIFIES the model; "
                    "quality is not checkpoint-equivalent.\n\n", c.topk, topk_override);
         c.topk = topk_override;
@@ -743,6 +750,13 @@ int main(int argc, char **argv)
            cache.nslot, (double)cache.slot_bytes / 1e6,
            (double)cache.nslot * cache.slot_bytes / 1e9,
            100.0 * cache.nslot / (double)(92 * c.n_experts));
+#ifdef K3_CUDA
+    /* Every routed expert is uploaded from this arena. Pinning it is the difference
+     * between a pageable 8 GB/s bounce copy and PCIe speed, on 1.6 GB per token. */
+    if (k3_cuda_enabled())
+        k3_cuda_register_host(cache.arena,
+                              (size_t)cache.nslot * cache.slot_bytes);
+#endif
 
     /* ---- buffers ---- */
     const int Tmax = np + gen + 1;
@@ -828,8 +842,13 @@ int main(int argc, char **argv)
      * figure against a single step would misstate the I/O share. */
     double expert_s_total = 0.0, expert_gb_total = 0.0;
     uint64_t expert_reqs_total = 0, expert_evict_total = 0;
+    const int cuda_profile = getenv("K3_CUDA_PROFILE") != NULL;
     for (int g = 0; g < gen; g++) {
         k3_cache_reset_stats(&cache);
+#ifdef K3_CUDA
+        if (cuda_profile && k3_cuda_enabled()) k3_cuda_step_reset();
+#endif
+        if (cuda_profile) k3_prof_reset();
         const double ts = now_s();
         int frc;
         if (incremental) {
@@ -871,6 +890,10 @@ int main(int argc, char **argv)
                req ? 100.0 * cache.hits / req : 0.0,
                (double)cache.bytes_read / 1e9, 1.0 / dt);
         fflush(stdout);
+#ifdef K3_CUDA
+        if (cuda_profile && k3_cuda_enabled()) k3_cuda_step_report(dt);
+#endif
+        if (cuda_profile) k3_prof_report(dt);
         /* Roll the per-step figures up before the next reset wipes them. */
         expert_s_total     += cache.load_seconds;
         expert_gb_total    += (double)cache.bytes_read / 1e9;

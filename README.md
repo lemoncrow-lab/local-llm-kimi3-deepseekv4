@@ -16,25 +16,37 @@ Batch 1, greedy incremental decode on one RTX 4090:
 | Mode | Layers | Routed experts/token | Trunk | Steady decode |
 |---|---:|---:|---|---:|
 | exact | 93 | 16 | checkpoint BF16 | 0.033 tok/s |
-| balanced | 93 | 4 | runtime Q4/group-128 | 0.408–0.451 tok/s |
-| fast | 93 | 1 | runtime Q4/group-128 | 0.673–1.033 tok/s |
+| balanced | 93 | 4 | resident mixed Q4/Q3, group 128 | 0.63–0.89 tok/s |
+| fast | 93 | 1 | resident mixed Q4/Q3, group 128 | 2.08–2.77 tok/s |
+| `--topk 0` | 93 | 0 | resident mixed Q4/Q3, group 128 | 6.07–6.57 tok/s |
 
-The fast and balanced presets are modified models. They retain all 93 language layers,
-but post-quantize the always-active BF16 trunk and reduce routed MoE top-k. They are not
-checkpoint-equivalent Kimi K3.
+Earlier releases packed the trunk at Q4/group-128, which is 28.9 GB: 20 GB fitted in
+VRAM and the remaining 9.2 GB was copied host-to-device **every token**, 0.54 s of the
+1.2 s a token took. The mixed format packs the large matrices at three bits and the
+routing-critical ones at four, 22.6 GB in total, so nothing crosses PCIe per token
+(measured 0.408–0.451 → 0.63–0.89 balanced, 0.673–1.033 → 2.08–2.77 fast).
 
-The first forward pass reads and compresses the 108.81 GB packed trunk. With a one-token
-input, measured warm-up was 27.57 seconds in fast mode and 32.79 seconds in balanced mode.
-A longer XTML prompt took 69.11 and 79.83 seconds respectively. Later tokens in the same
-process perform zero trunk reads. The cache is currently lost when the process exits.
+The fast, balanced and `--topk 0` presets are modified models. They retain all 93
+language layers, but post-quantize the always-active BF16 trunk and reduce or remove
+routed MoE top-k. They are not checkpoint-equivalent Kimi K3, and the mixed trunk is a
+larger departure than the Q4 one was: on the reference probe the argmax is unchanged
+but the logit vector correlates 0.64 with the Q4 path.
+
+The first forward pass reads and packs the 108.81 GB trunk: measured warm-up is now
+~44 s for a 28-token prompt in fast mode (69.11 s before). Later tokens in the same
+process perform zero trunk reads. The cache is still lost when the process exits.
 
 ## What changed
 
 - New CUDA Driver API/NVRTC backend compiled for Ada `compute_89`.
 - BF16 GEMV for higher-precision model matrices.
 - Native Kimi MXFP4/E8M0 expert GEMV directly from packed nibbles.
-- Runtime symmetric block-Q4 trunk packing and GEMV.
-- Two-tier compressed cache: 20 GB in VRAM plus about 9.2 GB in pinned host memory.
+- Runtime symmetric block-Q3/Q4 trunk packing and GEMV, with bf16 per-group scales and
+  an error-minimising scale search.
+- Mixed-precision resident cache (`K3_CUDA_CACHE_FORMAT=mix`): the whole trunk in VRAM
+  in one arena, no per-token host-to-device tier.
+- Page-locked expert arena, router GEMV on the GPU, `--topk 0`, and per-step CPU/GPU
+  profiling under `K3_CUDA_PROFILE=1`.
 - Source-layer-scoped cache keys so streamed layer buffers cannot alias.
 - Persistent layer metadata so the trunk is read once per process instead of once/token.
 - Configurable routed expert `--topk`.

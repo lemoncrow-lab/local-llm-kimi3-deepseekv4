@@ -261,6 +261,27 @@ static inline float k3_bf16f(uint16_t h)
 
 void k3_matmul_bf16(float *y, const float *x, const uint16_t *W, int in, int out);
 
+/* ------------------------------------------------------------- profiling ---- */
+/* Wall-clock attribution for one decode step, host side. The CUDA report says where
+ * backend time goes; this says where the REST goes, which on a streamed engine is the
+ * half nobody looks at. Zero cost when unused: the accumulators are plain doubles and
+ * the timer calls are compiled in unconditionally but only read when asked. */
+enum {
+    K3_PROF_LAYER = 0,   /* whole decoder layer, the parent of the rows below */
+    K3_PROF_ROUTER,      /* expert routing GEMV, on the CPU in f32            */
+    K3_PROF_KDA_REC,     /* KDA recurrence, per head, per token              */
+    K3_PROF_KDA_OTHER,   /* KDA projections, conv, norms, gate               */
+    K3_PROF_MLA,         /* softmax attention with the KV cache              */
+    K3_PROF_EXPERT_IO,   /* routed expert fetch: cache hit or disk read      */
+    K3_PROF_EXPERT_GEMM, /* routed expert matmuls (GPU time included)        */
+    K3_PROF_MOE_OTHER,   /* latent down/up and the shared expert            */
+    K3_PROF_N
+};
+extern double k3_prof[K3_PROF_N];
+double k3_prof_now(void);
+void   k3_prof_reset(void);
+void   k3_prof_report(double step_seconds);
+
 #ifdef K3_CUDA
 int  k3_cuda_init(int device);
 int  k3_cuda_enabled(void);
@@ -273,7 +294,11 @@ int  k3_cuda_matmul_mxfp4(float *y, const float *x,
                           const unsigned char *packed,
                           const unsigned char *scales,
                           int in, int rows, int group);
+int  k3_cuda_matmul_f32(float *y, const float *x, const float *W, int in, int rows);
+int  k3_cuda_register_host(void *ptr, size_t bytes);
 void k3_cuda_report(void);
+void k3_cuda_step_reset(void);
+void k3_cuda_step_report(double step_seconds);
 void k3_cuda_shutdown(void);
 #endif
 

@@ -25,9 +25,15 @@
  * Accumulators are double throughout. Hidden size is 7168 and expert rows are 2048
  * wide; a float32 accumulator loses precision the reference comparisons can see.
  */
+/* clock_gettime is POSIX, not C99, and test_cfg builds this file as strict -std=c99.
+ * Ask for the POSIX surface explicitly rather than relying on the compiler's default
+ * dialect, which differs between the engine build (gnu99) and that one. */
+#ifndef _POSIX_C_SOURCE
+#define _POSIX_C_SOURCE 200809L
+#endif
 #include "k3.h"
-
 #include <math.h>
+#include <time.h>
 #include <stdio.h>
 #include <stdlib.h>
 #include <string.h>
@@ -87,6 +93,37 @@ static inline float sigmoidf_(float x) { return 1.0f / (1.0f + expf(-x)); }
 
 /* See k3.h. Incremented whenever a streamed expert cannot be fetched. */
 long k3_expert_drops = 0;
+
+double k3_prof[K3_PROF_N];
+
+double k3_prof_now(void)
+{
+    struct timespec t;
+    clock_gettime(CLOCK_MONOTONIC, &t);
+    return (double)t.tv_sec + (double)t.tv_nsec * 1e-9;
+}
+
+void k3_prof_reset(void)
+{
+    for (int i = 0; i < K3_PROF_N; i++) k3_prof[i] = 0.0;
+}
+
+void k3_prof_report(double step_seconds)
+{
+    const double named = k3_prof[K3_PROF_ROUTER] + k3_prof[K3_PROF_KDA_REC]
+                       + k3_prof[K3_PROF_KDA_OTHER] + k3_prof[K3_PROF_MLA]
+                       + k3_prof[K3_PROF_EXPERT_IO] + k3_prof[K3_PROF_EXPERT_GEMM]
+                       + k3_prof[K3_PROF_MOE_OTHER];
+    fprintf(stderr,
+            "  host step: router %.3fs | kda-rec %.3fs | kda-other %.3fs | mla %.3fs "
+            "| expert-io %.3fs | expert-gemm %.3fs | moe-other %.3fs | layers %.3fs "
+            "(glue %.3fs) | outside layers %.3fs\n",
+            k3_prof[K3_PROF_ROUTER], k3_prof[K3_PROF_KDA_REC],
+            k3_prof[K3_PROF_KDA_OTHER], k3_prof[K3_PROF_MLA],
+            k3_prof[K3_PROF_EXPERT_IO], k3_prof[K3_PROF_EXPERT_GEMM],
+            k3_prof[K3_PROF_MOE_OTHER], k3_prof[K3_PROF_LAYER],
+            k3_prof[K3_PROF_LAYER] - named, step_seconds - k3_prof[K3_PROF_LAYER]);
+}
 
 void k3_situ_glu(float *y, const float *x, int n, float b1, float b2)
 {
@@ -398,6 +435,27 @@ void k3_router(int *idx, float *w, const float *x, const float *W,
      * ORDER INSIDE an expert is untouched: thread t still sums i = 0..hidden-1 in
      * sequence into its own double. Splitting the outer loop therefore cannot change a
      * single bit, which is why this needs no tolerance and no re-gating. */
+    int on_gpu = 0;
+#ifdef K3_CUDA
+    /* The gate is the last big matmul still on the CPU, and it is the one the CPU is
+     * worst at: 2.4 GB of f32 weights read per token across the 92 MoE layers. Packed
+     * into the resident cache it is 0.33 GB of VRAM and a rounding error of time.
+     * K3_ROUTER_CPU=1 restores the exact f64 path. */
+    static int router_cpu = -1;
+    if (router_cpu < 0) {
+        const char *env = getenv("K3_ROUTER_CPU");
+        router_cpu = env && *env && strcmp(env, "0");
+    }
+    if (!router_cpu && k3_cuda_enabled() &&
+        k3_cuda_matmul_f32(score, x, W, hidden, n_experts) == 0) {
+        on_gpu = 1;
+        for (int e = 0; e < n_experts; e++) {
+            score[e]  = 1.0f / (1.0f + expf(-score[e]));
+            choice[e] = score[e] + (bias ? bias[e] : 0.0f);
+        }
+    }
+#endif
+    if (!on_gpu)
 #ifdef _OPENMP
 #   pragma omp parallel for schedule(static)
 #endif
@@ -529,12 +587,34 @@ void k3_moe(float *out, const float *x, const K3MoeW *w, const K3Cfg *c,
         const float *xt = x + (size_t)t * E;
         float *ot = out + (size_t)t * E;
 
+        /* topk == 0 removes the routed half of the layer entirely: no routing, no
+         * expert read, no latent round trip, shared experts only. That is a DIFFERENT
+         * MODEL, not a faster way to run this one, and the CLI says so. It exists
+         * because it is the only configuration on a 24 GB card where nothing at all
+         * moves across PCIe or off the disk per token, which makes it the measurable
+         * ceiling everything else is compared against. */
+        if (c->topk == 0) {
+            const double t0s = k3_prof_now();
+            for (int i = 0; i < E; i++) ot[i] = 0.0f;
+            k3_mmw(sgu,      xt, w->sh1, w->wdt, E, SI);
+            k3_mmw(sgu + SI, xt, w->sh3, w->wdt, E, SI);
+            k3_situ_glu(sact, sgu, SI, c->situ_b1, c->situ_b2);
+            k3_mmw(sdn, sact, w->sh2, w->wdt, SI, E);
+            for (int i = 0; i < E; i++) ot[i] += sdn[i];
+            k3_prof[K3_PROF_MOE_OTHER] += k3_prof_now() - t0s;
+            continue;
+        }
+
         /* 1. route on the FULL width, before the down-projection */
+        double tp = k3_prof_now();
         k3_router(idx, wt, xt, w->gate, w->bias, E, c->n_experts, c->topk,
                   c->moe_renorm, c->routed_scale);
+        k3_prof[K3_PROF_ROUTER] += k3_prof_now() - tp;
 
         /* 2. down-project into the latent space */
+        tp = k3_prof_now();
         k3_mmw(z, xt, w->down, w->wdt, E, L);
+        k3_prof[K3_PROF_MOE_OTHER] += k3_prof_now() - tp;
 
         /* 3. the selected experts, in latent space, weighted and summed */
         for (int i = 0; i < L; i++) accL[i] = 0.0f;
@@ -543,12 +623,17 @@ void k3_moe(float *out, const float *x, const K3MoeW *w, const K3Cfg *c,
          * again: a queue depth of one against a drive that needs depth to reach its
          * rated bandwidth. getmany is optional and may be NULL, in which case nothing
          * changes and the loop reads them one at a time exactly as before. */
+        tp = k3_prof_now();
         if (w->src && w->src->getmany) w->src->getmany(w->src, w->layer, idx, c->topk);
+        k3_prof[K3_PROF_EXPERT_IO] += k3_prof_now() - tp;
         for (int j = 0; j < c->topk; j++) {
             if (w->src) {
                 /* Streamed: the expert stays MXFP4 and the matmul reads nibbles. */
                 K3ExpertQ q;
-                if (w->src->get(w->src, w->layer, idx[j], &q) != 0) {
+                tp = k3_prof_now();
+                const int miss = w->src->get(w->src, w->layer, idx[j], &q);
+                k3_prof[K3_PROF_EXPERT_IO] += k3_prof_now() - tp;
+                if (miss != 0) {
                     /* Never drop an expert silently. A bare `continue` here is
                      * invisible from the outside: one transient short read or EIO
                      * leaves this token's routed output missing 1/16 of its weighted
@@ -562,10 +647,12 @@ void k3_moe(float *out, const float *x, const K3MoeW *w, const K3Cfg *c,
                                     "this token is CORRUPT\n", w->layer, idx[j]);
                     continue;
                 }
+                tp = k3_prof_now();
                 k3_matmul_mxfp4(gu,     z, q.p1, q.s1, L, I, K3_MXFP4_GROUP);
                 k3_matmul_mxfp4(gu + I, z, q.p3, q.s3, L, I, K3_MXFP4_GROUP);
                 k3_situ_glu(act, gu, I, c->situ_b1, c->situ_b2);
                 k3_matmul_mxfp4(edn, act, q.p2, q.s2, I, L, K3_MXFP4_GROUP);
+                k3_prof[K3_PROF_EXPERT_GEMM] += k3_prof_now() - tp;
             } else {
                 const float *e1 = w->w1 + (size_t)idx[j] * I * L;   /* gate */
                 const float *e3 = w->w3 + (size_t)idx[j] * I * L;   /* up   */
@@ -580,6 +667,7 @@ void k3_moe(float *out, const float *x, const K3MoeW *w, const K3Cfg *c,
         }
 
         /* 4. RMSNorm the AGGREGATE (not per expert), then 5. up-project */
+        tp = k3_prof_now();
         if (c->latent_norm) k3_rmsnorm(accL, accL, w->latent_norm, L, c->rms_eps);
         k3_mmw(ot, accL, w->up, w->wdt, L, E);
 
@@ -589,6 +677,7 @@ void k3_moe(float *out, const float *x, const K3MoeW *w, const K3Cfg *c,
         k3_situ_glu(sact, sgu, SI, c->situ_b1, c->situ_b2);
         k3_mmw(sdn, sact, w->sh2, w->wdt, SI, E);
         for (int i = 0; i < E; i++) ot[i] += sdn[i];
+        k3_prof[K3_PROF_MOE_OTHER] += k3_prof_now() - tp;
     }
 }
 
@@ -670,6 +759,7 @@ void k3_kda_layer(float *out, const float *x, const K3KdaW *w, const K3Cfg *c,
     }
 
     /* 6. recurrence, per head, with q pre-scaled by d_k^-0.5 */
+    const double t_rec0 = k3_prof_now();
     float *S = state;
     float *Sown = NULL;
     if (!S) {
@@ -687,6 +777,7 @@ void k3_kda_layer(float *out, const float *x, const K3KdaW *w, const K3Cfg *c,
             k3_kda_step(S + (size_t)h * D * D, o + off, wr, k + off, v + off,
                         al + off, bt[(size_t)t * H + h], D, D);
         }
+    k3_prof[K3_PROF_KDA_REC] += k3_prof_now() - t_rec0;
 
     /* 7/8/9. head-wise RMSNorm, THEN the gate, THEN the output projection */
     for (int t = 0; t < T; t++) {
@@ -731,6 +822,7 @@ void k3_decoder_layer_inc(float *h, float *block_residual, int *n_blocks,
                           int T, float *state, float *scratch,
                           float *kvc, float *ropec, int cached, int cap)
 {
+    const double t_layer0 = k3_prof_now();
     const int E = c->hidden;
     const int maxb = c->n_layers / c->attn_res_block + 2;
 
@@ -778,8 +870,11 @@ void k3_decoder_layer_inc(float *h, float *block_residual, int *n_blocks,
     /* attention */
     for (int t = 0; t < T; t++)
         k3_rmsnorm(hin + (size_t)t * E, h + (size_t)t * E, w->in_norm, E, c->rms_eps);
+    const double t_attn0 = k3_prof_now();
     if (w->kda) k3_kda_layer(tmp, hin, w->kda, c, T, state, sub);
     else        k3_mla_cached(tmp, hin, w->mla, c, T, sub, kvc, ropec, cached, cap);
+    if (w->kda) k3_prof[K3_PROF_KDA_OTHER] += k3_prof_now() - t_attn0;
+    else        k3_prof[K3_PROF_MLA]       += k3_prof_now() - t_attn0;
 
     if (have_prefix) for (size_t i = 0; i < (size_t)T * E; i++) pref[i] += tmp[i];
     else             { memcpy(pref, tmp, (size_t)T * E * sizeof(float)); have_prefix = 1; }
@@ -813,6 +908,7 @@ void k3_decoder_layer_inc(float *h, float *block_residual, int *n_blocks,
 
     for (size_t i = 0; i < (size_t)T * E; i++) pref[i] += tmp[i];
     memcpy(h, pref, (size_t)T * E * sizeof(float));
+    k3_prof[K3_PROF_LAYER] += k3_prof_now() - t_layer0;
 }
 
 void k3_decoder_layer(float *h, float *block_residual, int *n_blocks,

@@ -5,6 +5,27 @@ versioning follows [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
 
 ## [Unreleased]
 
+### Added
+
+- `K3_CUDA_CACHE_FORMAT=mix`: mixed Q4/Q3 resident cache that packs the whole 108.81 GB
+  trunk into 22.6 GB of VRAM, removing the 9.2 GB per-token host-to-device tier.
+  Threshold via `K3_CUDA_Q4_MAX_ELEMS`, staging via `K3_CUDA_STAGE_MB`,
+  error-minimising scale search via `K3_CUDA_QOPT`.
+- Router GEMV on the GPU (`K3_ROUTER_CPU=1` restores the exact f64 CPU path) and a
+  page-locked expert arena.
+- `--topk 0`: shared experts only, no routed path. A different model; measured as the
+  ceiling of the current graph at 6.07-6.57 tok/s.
+- `K3_CUDA_PROFILE=1`: per-step attribution of CPU and GPU time.
+
+### Changed
+
+- Packed per-group scales are bf16 rather than f32, and packed tensors are
+  suballocated from one arena instead of two `cuMemAlloc`s each.
+- Steady decode, one RTX 4090: fast 0.673-1.033 -> 2.08-2.77 tok/s, balanced
+  0.408-0.451 -> 0.63-0.89 tok/s, warm-up 69 s -> 44 s. The mixed trunk moves the logit
+  vector (Pearson 0.64 against the Q4 path); the argmax on the reference probe does not
+  change.
+
 ## [0.1.0] - 2026-07-31
 
 First public release.
