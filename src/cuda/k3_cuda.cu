@@ -407,6 +407,7 @@ typedef struct {
     int q4_cache;
     int mix;
     int qopt;
+    int cpu_lane;
     CUdeviceptr arena;
     size_t arena_cap;
     size_t arena_used;
@@ -499,50 +500,6 @@ static K3CudaCacheEntry *cache_push(void)
     return e;
 }
 
-/* Plain BF16 residency, used only when no packed format is selected. Kept because it
- * is the one path that changes no arithmetic at all, which makes it the reference the
- * packed formats are measured against. */
-static int cached_bf16(const void *host, size_t bytes, CUdeviceptr *device,
-                       int *needs_upload)
-{
-    *needs_upload = 0;
-    if (!g_cuda.cacheable || g_cuda.cache_budget == 0 ||
-        g_cuda.q3_cache || g_cuda.q4_cache || g_cuda.mix) return 1;
-
-    K3CudaCacheEntry *e = cache_find(host, bytes);
-    if (e && e->bits == 0) { *device = e->device; g_cuda.cache_hits++; return 0; }
-
-    g_cuda.cache_misses++;
-    if (bytes > g_cuda.cache_budget - g_cuda.cache_bytes) return 1;
-
-    CUdeviceptr ptr = 0;
-    if (driver_error(cuMemAlloc(&ptr, bytes), "cuMemAlloc(cache)") != 0) return -1;
-    e = cache_push();
-    if (!e) { cuMemFree(ptr); return -1; }
-    e->host = host;
-    e->bytes = bytes;
-    e->scope = g_cuda.cache_scope;
-    e->bits = 0;
-    e->device = ptr;
-    e->packed_bytes = bytes;
-    g_cuda.cache_bytes += bytes;
-    *device = ptr;
-    *needs_upload = 1;
-    return 0;
-}
-
-static size_t packed_size(int bits, int in, int rows)
-{
-    return bits == 3 ? (size_t)rows * (size_t)(in / 8) * 3
-                     : (size_t)rows * (size_t)(in / 2);
-}
-
-static size_t scale_size(int in, int rows)
-{
-    const int group = g_cuda.q3_group;
-    return (size_t)rows * (size_t)((in + group - 1) / group) * sizeof(unsigned short);
-}
-
 /* ONE arena, bump-allocated.
  *
  * The cache holds ~2,400 tensors, and cuMemAlloc rounds every request up to a 2 MB
@@ -571,6 +528,48 @@ static int arena_take(size_t bytes, CUdeviceptr *out)
     *out = g_cuda.arena + base;
     g_cuda.arena_used = base + bytes;
     return 0;
+}
+
+/* Plain BF16 residency, used only when no packed format is selected. Kept because it
+ * is the one path that changes no arithmetic at all, which makes it the reference the
+ * packed formats are measured against. */
+static int cached_bf16(const void *host, size_t bytes, CUdeviceptr *device,
+                       int *needs_upload)
+{
+    *needs_upload = 0;
+    if (!g_cuda.cacheable || g_cuda.cache_budget == 0 ||
+        g_cuda.q3_cache || g_cuda.q4_cache || g_cuda.mix) return 1;
+
+    K3CudaCacheEntry *e = cache_find(host, bytes);
+    if (e && e->bits == 0) { *device = e->device; g_cuda.cache_hits++; return 0; }
+
+    g_cuda.cache_misses++;
+    CUdeviceptr ptr = 0;
+    if (arena_take(bytes, &ptr) != 0) return 1;
+    e = cache_push();
+    if (!e) return -1;
+    e->host = host;
+    e->bytes = bytes;
+    e->scope = g_cuda.cache_scope;
+    e->bits = 0;
+    e->device = ptr;
+    e->packed_bytes = bytes;
+    g_cuda.cache_bytes = g_cuda.arena_used;
+    *device = ptr;
+    *needs_upload = 1;
+    return 0;
+}
+
+static size_t packed_size(int bits, int in, int rows)
+{
+    return bits == 3 ? (size_t)rows * (size_t)(in / 8) * 3
+                     : (size_t)rows * (size_t)(in / 2);
+}
+
+static size_t scale_size(int in, int rows)
+{
+    const int group = g_cuda.q3_group;
+    return (size_t)rows * (size_t)((in + group - 1) / group) * sizeof(unsigned short);
 }
 
 /* Which precision a matrix is admitted at, and the whole point of the mixed cache.
@@ -869,6 +868,12 @@ extern "C" int k3_cuda_init(int device_index)
     g_cuda.q4_max_elems = 26000000u;
     const char *q4max = getenv("K3_CUDA_Q4_MAX_ELEMS");
     if (q4max && *q4max) g_cuda.q4_max_elems = (size_t)strtoull(q4max, NULL, 10);
+    /* On by default wherever a packed cache is NOT holding the whole trunk: that is
+     * exactly the configuration where matrices spill, and spilling to the CPU beats
+     * spilling to PCIe. */
+    g_cuda.cpu_lane = !(g_cuda.q3_cache || g_cuda.q4_cache || g_cuda.mix);
+    const char *lane_env = getenv("K3_CUDA_CPU_LANE");
+    if (lane_env && *lane_env) g_cuda.cpu_lane = strcmp(lane_env, "0") != 0;
     g_cuda.qopt = 1;
     const char *qopt_env = getenv("K3_CUDA_QOPT");
     if (qopt_env && *qopt_env) g_cuda.qopt = atoi(qopt_env);
@@ -903,14 +908,14 @@ extern "C" int k3_cuda_init(int device_index)
      * staging pair, the activation vectors and allocator slack. Erring tight here is
      * what pushes a trunk that would have fitted into the per-token PCIe tier, so it
      * is computed rather than guessed. */
-    const size_t reserve_bytes = (g_cuda.q3_cache || g_cuda.q4_cache || g_cuda.mix)
-        ? (g_cuda.stage_bytes + ((size_t)768 << 20))
-        : ((size_t)4 << 30);
+    const size_t reserve_bytes = g_cuda.cpu_lane
+        ? ((size_t)768 << 20)                       /* nothing big is ever staged */
+        : (g_cuda.stage_bytes + ((size_t)768 << 20));
     size_t safe = free_bytes > reserve_bytes ? free_bytes - reserve_bytes : 0;
     g_cuda.cache_budget = requested < safe ? requested : safe;
     g_cuda.cacheable = 1;
     g_cuda.enabled = 1;
-    if ((g_cuda.q3_cache || g_cuda.q4_cache || g_cuda.mix) && g_cuda.cache_budget) {
+    if (g_cuda.cache_budget) {
         /* Claim the whole cache up front. If the card cannot give it, halve and retry
          * rather than discovering it 90 layers into a warm-up. */
         while (g_cuda.cache_budget > ((size_t)1 << 30) &&
@@ -1027,6 +1032,16 @@ extern "C" int k3_cuda_matmul_bf16(float *y, const float *x, const uint16_t *wei
         }
         return 0;
     }
+
+    /* THE CPU LANE. A matrix that did not win a VRAM slot has to be multiplied
+     * somewhere, and the choice is not obvious: shipping it to the GPU costs a PCIe
+     * crossing at a measured 18.3 GB/s, while multiplying it in place costs a sweep of
+     * host RAM at roughly 50 GB/s on this machine. For a batch-1 GEMV, which is purely
+     * memory bound and does no arithmetic worth moving data for, the CPU wins by more
+     * than a factor of two -- and the exact preset has 87 GB per token that cannot fit
+     * in VRAM at any setting. So: return 1 and let k3_mmw run the AVX2 kernel from the
+     * bytes that are already in RAM. K3_CUDA_CPU_LANE=0 restores the upload path. */
+    if (g_cuda.cpu_lane) return 1;
 
     /* Uncacheable: a BF16 matrix uploaded for this call only. Correct, and slow enough
      * that the run summary counts every one of them. */

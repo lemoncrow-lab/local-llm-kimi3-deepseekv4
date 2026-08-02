@@ -214,6 +214,22 @@ offloaded. Device-resident activations, the KDA recurrence on the GPU (0.045 s/t
 626 MB of state) and an asynchronous expert prefetch are the next three items, in that
 order.
 
+## exact mode: multiply in RAM, do not upload
+
+Exact keeps the BF16 trunk, so 86 of its 108.81 GB cannot be resident on a 24 GB card.
+Uploading those bytes costs PCIe at a measured 18.3 GB/s; multiplying them where they
+already are costs a host-RAM sweep. On an 8-layer slice with a deliberately small 4 GB
+VRAM cache and `--topk 16`, the lane measured 0.78-0.85 s/token against 1.60-1.63 with
+the upload path, and produced the same three tokens: 138932, 126023, 153224.
+
+Full-model exact speed is then set by how much trunk fits in RAM, because an unpinned
+layer costs 1.17 GB of NVMe at 6.2 GB/s every token. With ~60 GB available (this
+measurement) only about a third of the trunk pins and a step measures 32 s, unchanged.
+With ~115 GB free the whole trunk pins and the arithmetic says 8-13 s/token.
+
+Neither the lane nor anything else lifts exact past **0.71 tok/s** on one card: top-16
+routing moves 25.83 GB of expert bytes per token and PCIe delivers 18.3 GB/s.
+
 ## Current bottleneck and next target
 
 The practical Q4 cache is larger than available VRAM, leaving about 9.2 GB in pinned host

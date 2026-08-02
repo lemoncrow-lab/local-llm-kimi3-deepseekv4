@@ -16,6 +16,10 @@ versioning follows [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
 - `--topk 0`: shared experts only, no routed path. A different model; measured as the
   ceiling of the current graph at 6.07-6.57 tok/s.
 - `K3_CUDA_PROFILE=1`: per-step attribution of CPU and GPU time.
+- CPU lane (`K3_CUDA_CPU_LANE`, default on when no packed cache holds the trunk): BF16
+  matrices that do not fit in VRAM are multiplied in host RAM instead of being uploaded
+  over PCIe. Measured 2.0x on an 8-layer exact-mode slice with byte-identical output;
+  full-model exact speed is gated by how much of the trunk fits in RAM, not by this.
 
 ### Changed
 
