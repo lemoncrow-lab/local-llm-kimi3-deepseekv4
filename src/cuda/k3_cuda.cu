@@ -1041,16 +1041,15 @@ extern "C" int k3_cuda_matmul_bf16(float *y, const float *x, const uint16_t *wei
      * than a factor of two -- and the exact preset has 87 GB per token that cannot fit
      * in VRAM at any setting. So: return 1 and let k3_mmw run the AVX2 kernel from the
      * bytes that are already in RAM. K3_CUDA_CPU_LANE=0 restores the upload path. */
-    if (g_cuda.cpu_lane) return 1;
-
-    /* Uncacheable: a BF16 matrix uploaded for this call only. Correct, and slow enough
-     * that the run summary counts every one of them. */
+    /* A matrix that WINS a VRAM slot still belongs on the GPU: it is uploaded once and
+     * then multiplied at 350+ GB/s forever. The lane is for the ones that lose. */
     CUdeviceptr device_weights = 0;
     int upload_weights = 0;
     const int cache_result = cached_bf16(weights, wbytes, &device_weights,
                                          &upload_weights);
     if (cache_result < 0) return -1;
     if (cache_result > 0) {
+        if (g_cuda.cpu_lane) return 1;
         if (reserve(&g_cuda.weights, &g_cuda.weights_cap, wbytes) != 0) return -1;
         device_weights = g_cuda.weights;
         upload_weights = 1;
