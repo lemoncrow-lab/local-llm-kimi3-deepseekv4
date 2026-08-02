@@ -1,4 +1,7 @@
 /* k3_trunk.h - stream the resident trunk, so RAM becomes a dial instead of a floor.
+ * Modified 2026-08: optional persistent metadata supports an experimental CUDA Q4
+ * trunk cache. That modified path accepts the quality trade-off discussed below; the
+ * exact path continues to stream the checkpoint's BF16 bytes.
  *
  * WHY STREAM THE TRUNK AT ALL
  *   The engine holds 110 GB of trunk plus 4.70 GB of embed/lm_head. That is the floor
@@ -80,6 +83,8 @@ typedef struct {
      * it 2.34 GB against 1.27 GB for a normal layer, wasting about half the budget. */
     unsigned char **pin;        /* [npin] one exact allocation per pinned layer */
     unsigned char *arena;       /* [nslot] uniform ring slots                   */
+    unsigned char **meta;       /* optional persistent fp32 vectors [n_layers]  */
+    int          persist_meta;  /* K3_TRUNK_PERSIST_META, for compressed CUDA    */
     int64_t      slot_bytes;    /* raw run + the widen area                     */
     int64_t      widen_bytes;   /* of slot_bytes, the fp32 expansion area       */
     int          nslot;

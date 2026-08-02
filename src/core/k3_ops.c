@@ -1,3 +1,4 @@
+/* Modified 2026-08: optional CUDA matrix-vector dispatch. See MODIFICATIONS.md. */
 /* k3_ops.c - the numeric core of the Kimi K3 engine.
  *
  * Every routine here is gated on a JSON fixture under tests/fixtures/ops/, generated
@@ -966,6 +967,11 @@ static void k3_e8m0_init(void)
 void k3_matmul_mxfp4(float *y, const float *x, const unsigned char *packed,
                      const unsigned char *scales, int in, int rows, int group)
 {
+#ifdef K3_CUDA
+    if (k3_cuda_enabled() &&
+        k3_cuda_matmul_mxfp4(y, x, packed, scales, in, rows, group) == 0)
+        return;
+#endif
     const int pcols = in / 2;                     /* two elements per byte */
     const int ngrp  = (in + group - 1) / group;
     const int gbyte = group / 2;

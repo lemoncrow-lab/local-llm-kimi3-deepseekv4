@@ -1,3 +1,4 @@
+/* Modified 2026-08: reusable binding plan for persistent trunk metadata. See MODIFICATIONS.md. */
 /* k3_bind.c - see k3_bind.h. */
 #define _POSIX_C_SOURCE 200809L
 
@@ -306,15 +307,29 @@ void k3_bind_free(K3LayerBind *b)
 
 size_t k3_bind_widen_bytes(const K3Cfg *c)
 {
-    /* Only the BF16 vectors that kernels read elementwise are copied. Everything else
-     * is pointed at in place. The router gate dominates: it is BF16 on disk but stays
-     * fp32 in the engine because k3_router walks it with its own inline matmul. */
-    const size_t H = (size_t)c->hidden;
-    size_t n = 6 * H                       /* in/post norm, attn-res and mlp-res pair  */
-             + (size_t)c->q_lora + c->kv_lora   /* MLA q_a/kv_a layernorms             */
-             + (size_t)c->latent                /* routed_expert_norm                  */
-             + (size_t)c->n_experts * H;        /* router gate                          */
-    return n * sizeof(float) + 4096;       /* slack for per-tensor 8-byte alignment    */
+    /* Derive the bound from the same binding plan that consumes it.  This used to count
+     * only BF16 vectors because on-disk FP32 vectors pointed into the streaming ring.
+     * Persistent compressed CUDA must copy those too; a handwritten list missed KDA
+     * state/conv metadata and under-allocated by 613 KB on layer 1. */
+    size_t maximum = 0;
+    for (int L = 0; L < c->n_layers; L++) {
+        K3LayerBind b;
+        Plan p;
+        memset(&b, 0, sizeof b);
+        memset(&p, 0, sizeof p);
+        p.narrow_ok = 1;
+        plan_layer(&p, c, L, &b, k3_is_mla(c, L), k3_is_dense(c, L));
+
+        size_t bytes = 0;
+        for (int i = 0; i < p.n; i++) {
+            const Req *q = &p.r[i];
+            if (q->narrow) continue;
+            bytes = (bytes + 7u) & ~(size_t)7u;
+            bytes += (size_t)q->take * sizeof(float);
+        }
+        if (bytes > maximum) maximum = bytes;
+    }
+    return maximum + 4096;
 }
 
 int k3_bind_layer_mem(const K3Cfg *c, int L, K3LayerBind *b,
@@ -356,9 +371,21 @@ int k3_bind_layer_mem(const K3Cfg *c, int L, K3LayerBind *b,
             else { *q->dest = run + off; continue; }
         }
 
-        /* Wanted as fp32. If it is already F32 on disk, point at it; a prefix take
-         * (A_log) is just the front of the same array, so that is free too. */
-        if (dt == K3_DT_F32) { *q->dest = run + off; continue; }
+        /* Keep every elementwise tensor in the caller's widen area.  Streaming CUDA
+         * can then retain this small metadata while the ring holding large matrices is
+         * reused, eliminating a 108 GB trunk reread after compressed warm-up. */
+        if (dt == K3_DT_F32) {
+            w = (w + 7u) & ~(size_t)7u;
+            const size_t bytes = (size_t)q->take * sizeof(float);
+            if (w + bytes > widen_cap) {
+                fprintf(stderr, "k3_bind_mem: metadata area too small at %s\n", q->name);
+                return -1;
+            }
+            memcpy(widen + w, run + off, bytes);
+            *q->dest = widen + w;
+            w += bytes;
+            continue;
+        }
 
         if (dt != K3_DT_BF16) {
             fprintf(stderr, "k3_bind_mem: %s has dtype %d, cannot widen\n", q->name, dt);

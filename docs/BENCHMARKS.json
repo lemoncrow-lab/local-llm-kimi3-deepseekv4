@@ -1,0 +1,82 @@
+{
+  "schema_version": 1,
+  "base_model": "moonshotai/Kimi-K3",
+  "engine_upstream_commit": "85ab2cd901aa81b70caac7711f06864d594b8ff3",
+  "target_gpu": "NVIDIA GeForce RTX 4090 24GB",
+  "method": {
+    "batch_size": 1,
+    "decode": "greedy incremental",
+    "steady_state_excludes_first_warmup_step": true
+  },
+  "artifacts": {
+    "checkpoint_shards": 96,
+    "checkpoint_bytes": 1560936091448,
+    "trunk_layers": 93,
+    "trunk_bytes": 108811952128
+  },
+  "results": [
+    {
+      "name": "cuda_exact_single_id",
+      "layers": 93,
+      "routed_topk": 16,
+      "trunk_format": "checkpoint_bf16",
+      "seconds_per_token": 30.21,
+      "tokens_per_second": 0.033,
+      "generated_token_id": 9689
+    },
+    {
+      "name": "cuda_balanced_single_id",
+      "layers": 93,
+      "routed_topk": 4,
+      "trunk_format": "runtime_symmetric_q4_group128",
+      "warmup_seconds": 32.79,
+      "steady_tokens_per_second": [0.416, 0.431, 0.422, 0.421, 0.418],
+      "steady_average_tokens_per_second": 0.4216,
+      "trunk_read_gb": 108.81,
+      "trunk_binds": 93
+    },
+    {
+      "name": "cuda_fast_single_id",
+      "layers": 93,
+      "routed_topk": 1,
+      "trunk_format": "runtime_symmetric_q4_group128",
+      "warmup_seconds": 27.57,
+      "steady_tokens_per_second": [0.885, 0.872, 0.972, 0.983, 1.033],
+      "steady_average_tokens_per_second": 0.949,
+      "trunk_read_gb": 108.81,
+      "trunk_binds": 93
+    },
+    {
+      "name": "cuda_balanced_xtml",
+      "layers": 93,
+      "routed_topk": 4,
+      "warmup_seconds": 79.83,
+      "steady_tokens_per_second_min": 0.408,
+      "steady_tokens_per_second_max": 0.451
+    },
+    {
+      "name": "cuda_fast_xtml",
+      "layers": 93,
+      "routed_topk": 1,
+      "warmup_seconds": 69.11,
+      "steady_tokens_per_second_min": 0.673,
+      "steady_tokens_per_second_max": 0.937
+    }
+  ],
+  "numeric_gates": {
+    "bf16_cpu_vs_cuda": {
+      "max_abs_logit_error": 0.000002384186,
+      "mean_abs_logit_error": 0.0000003085209,
+      "pearson": 1.0,
+      "same_argmax": true
+    },
+    "q4_group128_vs_bf16": {
+      "max_abs_logit_error": 1.357734,
+      "mean_abs_logit_error": 0.20808391,
+      "pearson": 0.9892295088799061,
+      "same_argmax": true,
+      "argmax_token_id": 22436
+    }
+  },
+  "disclosure": "balanced and fast alter trunk precision and routed expert top-k"
+}

@@ -1,3 +1,19 @@
+---
+license: apache-2.0
+base_model: moonshotai/Kimi-K3
+pipeline_tag: text-generation
+library_name: custom
+tags:
+- kimi-k3
+- mixture-of-experts
+- cuda
+- rtx-4090
+- mxfp4
+- q4
+- nvme
+- c
+---
+
 # Kimi K3 on one RTX 4090 — experimental CUDA inference
 
 This repository is a modified fork of

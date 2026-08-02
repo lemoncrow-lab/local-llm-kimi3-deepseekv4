@@ -1,4 +1,5 @@
-/* k3_trunk.c - see k3_trunk.h for why the trunk is streamed rather than quantised. */
+/* Modified 2026-08: persistent metadata for compressed CUDA warm-cache mode. See MODIFICATIONS.md. */
+/* k3_trunk.c - see k3_trunk.h for the streaming design. */
 #define _GNU_SOURCE            /* O_DIRECT */
 #define _POSIX_C_SOURCE 200809L
 #define _FILE_OFFSET_BITS 64
@@ -243,6 +244,11 @@ int k3_trunk_open(K3Trunk *tr, const char *dir, const K3Cfg *c, int64_t budget_b
     tr->layer_of = (int *)malloc((size_t)RING * sizeof(int));
     for (int i = 0; i < RING; i++) tr->layer_of[i] = -1;
     tr->widen_bytes = (int64_t)widen;
+    tr->persist_meta = getenv("K3_TRUNK_PERSIST_META") != NULL;
+    if (tr->persist_meta) {
+        tr->meta = (unsigned char **)calloc((size_t)tr->n_layers, sizeof(*tr->meta));
+        if (!tr->meta) return -1;
+    }
 
     printf("trunk stream: %.2f GB packed, %d/%d layers PINNED (%.2f GB), "
            "ring %d x %.2f GB\n",
@@ -253,6 +259,10 @@ int k3_trunk_open(K3Trunk *tr, const char *dir, const K3Cfg *c, int64_t budget_b
            tr->direct ? "O_DIRECT (page cache bypassed)" : "buffered I/O");
     printf("              deterministic hit rate %.1f%% (a cyclic scan defeats LRU, so "
            "a pinned prefix is used instead)\n", 100.0 * npin / tr->n_layers);
+    if (tr->persist_meta)
+        printf("              persistent layer metadata %.2f GB (enables zero trunk reads "
+               "after compressed warm-up)\n",
+               (double)tr->n_layers * tr->widen_bytes / 1e9);
     return 0;
 bad:
     free(txt);
@@ -264,6 +274,10 @@ void k3_trunk_close(K3Trunk *tr)
     if (tr->fd >= 0) close(tr->fd);
     if (tr->pin) { for (int i = 0; i < tr->npin; i++) free(tr->pin[i]); free(tr->pin); }
     free(tr->arena); free(tr->layer_of); free(tr->slot_of);
+    if (tr->meta) {
+        for (int i = 0; i < tr->n_layers; i++) free(tr->meta[i]);
+        free(tr->meta);
+    }
     if (tr->lay) { for (int i = 0; i < tr->n_layers; i++) free(tr->lay[i].t); free(tr->lay); }
     free(tr->json_arena);   /* every K3TrunkTensor.name points into this */
     memset(tr, 0, sizeof *tr);
@@ -363,8 +377,18 @@ int k3_trunk_bind(K3Trunk *tr, const K3Cfg *c, int L, K3LayerBind *b)
 
     Finder f; f.L = &tr->lay[L];
     K3MemSrc src; src.find = find_in_layer; src.ctx = &f;
-    unsigned char *widen = base + (((tr->lay[L].nbytes + K3_TRUNK_ALIGN - 1)
-                                    & ~(int64_t)(K3_TRUNK_ALIGN - 1)));
+    unsigned char *widen;
+    if (tr->persist_meta) {
+        if (!tr->meta[L] &&
+            posix_memalign((void **)&tr->meta[L], 64, (size_t)tr->widen_bytes) != 0) {
+            fprintf(stderr, "k3_trunk: cannot allocate persistent metadata for layer %d\n", L);
+            return -1;
+        }
+        widen = tr->meta[L];
+    } else {
+        widen = base + (((tr->lay[L].nbytes + K3_TRUNK_ALIGN - 1)
+                         & ~(int64_t)(K3_TRUNK_ALIGN - 1)));
+    }
     /* Pinned layers own exactly nbytes + widen; ring slots own slot_bytes. */
     const size_t cap = (size_t)tr->widen_bytes;
     const double tw = now_s();

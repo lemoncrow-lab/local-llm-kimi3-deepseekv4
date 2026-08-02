@@ -1,4 +1,5 @@
 # Kimi K3 inference engine.
+# Modified 2026-08: optional RTX 4090 CUDA/NVRTC target. See MODIFICATIONS.md.
 #
 #   make                build the engine (bin/k3)
 #   make test           run every test that needs no model weights
@@ -13,10 +14,18 @@
 
 # ---------------------------------------------------------------------------- config --
 CC       ?= cc
+CXX      ?= c++
+CUDA_CXX ?= clang++
 PYTHON   ?= python3
 BUILD    ?= build
 BIN      ?= bin
 PREFIX   ?= /usr/local
+
+CUDA_PYTHON     ?= .venv/bin/python
+CUDA_SITE       ?= $(shell $(CUDA_PYTHON) -c 'import site; print(site.getsitepackages()[0])' 2>/dev/null)
+CUDA_RUNTIME    ?= $(CUDA_SITE)/nvidia/cuda_runtime
+CUDA_NVRTC      ?= $(CUDA_SITE)/nvidia/cuda_nvrtc
+CUDA_BUILD      ?= build-cuda
 
 # -march=native is a real win on the expert matmuls but produces a binary that will not
 # run on an older CPU. `make portable` drops it.
@@ -64,10 +73,33 @@ TOK_FILES  ?= $(HOME)/k3model
 # two concurrent `make test` runs cannot race on one filename and `make clean` removes it.
 
 # ---------------------------------------------------------------------------- targets --
-.PHONY: all test test-all bench portable debug asan ubsan format clean install help \
+.PHONY: all cuda test test-all bench portable debug asan ubsan format clean install help \
         tok cfg ops cache st oracle weights-test
 
 all: $(CLI_BIN)
+
+CUDA_ENGINE_OBJ := $(patsubst %.c,$(CUDA_BUILD)/%.o,$(ENGINE_SRC))
+CUDA_CLI_OBJ := $(CUDA_BUILD)/src/cli/k3_run.o
+CUDA_OBJ := $(CUDA_BUILD)/src/cuda/k3_cuda.o
+CUDA_BIN := $(BIN)/k3-cuda
+CUDA_DEFS := -DK3_CUDA
+CUDA_NVRTC_LIB := $(CUDA_NVRTC)/lib/libnvrtc.so.12
+CUDA_DRIVER_LIB := /usr/lib/x86_64-linux-gnu/libcuda.so.1
+
+cuda: $(CUDA_BIN)
+
+$(CUDA_BUILD)/%.o: %.c
+	@mkdir -p $(dir $@)
+	$(CC) $(CFLAGS) $(CUDA_DEFS) $(INCLUDES) -c $< -o $@
+
+$(CUDA_OBJ): src/cuda/k3_cuda.cu
+	@mkdir -p $(dir $@)
+	$(CUDA_CXX) -x c++ -O3 -std=c++17 -I$(CUDA_RUNTIME)/include \
+	    -I$(CUDA_NVRTC)/include $(INCLUDES) -c $< -o $@
+
+$(CUDA_BIN): $(CUDA_CLI_OBJ) $(CUDA_ENGINE_OBJ) $(CUDA_OBJ) | $(BIN)
+	$(CUDA_CXX) $^ -o $@ $(LDFLAGS) $(CUDA_NVRTC_LIB) $(CUDA_DRIVER_LIB) \
+	    -Wl,-rpath,$(CUDA_NVRTC)/lib
 
 $(BUILD)/%.o: %.c
 	@mkdir -p $(dir $@)
@@ -185,7 +217,7 @@ install: $(CLI_BIN)
 	install -m 644 third_party/json.h $(DESTDIR)$(PREFIX)/include/k3/
 
 clean:
-	rm -rf $(BUILD) $(BIN)
+	rm -rf $(BUILD) $(CUDA_BUILD) $(BIN)
 
 ## help: list targets
 help:

@@ -1,4 +1,5 @@
 /* SPDX-License-Identifier: Apache-2.0 */
+/* Modified 2026-08: optional CUDA dispatch/cache API. See MODIFICATIONS.md. */
 /*
  * k3.h, Kimi K3 inference engine: public configuration and core types.
  *
@@ -260,11 +261,32 @@ static inline float k3_bf16f(uint16_t h)
 
 void k3_matmul_bf16(float *y, const float *x, const uint16_t *W, int in, int out);
 
+#ifdef K3_CUDA
+int  k3_cuda_init(int device);
+int  k3_cuda_enabled(void);
+int  k3_cuda_compressed_cache(void);
+int  k3_cuda_compressed_complete(void);
+void k3_cuda_set_cache_scope(int scope, int cacheable);
+int  k3_cuda_matmul_bf16(float *y, const float *x, const uint16_t *W,
+                         int in, int out);
+int  k3_cuda_matmul_mxfp4(float *y, const float *x,
+                          const unsigned char *packed,
+                          const unsigned char *scales,
+                          int in, int rows, int group);
+void k3_cuda_report(void);
+void k3_cuda_shutdown(void);
+#endif
+
 /* The one call every trunk matmul goes through. Dispatch is a predictable branch on a
  * per-layer flag, outside the inner loops, so it costs nothing measurable. */
 static inline void k3_mmw(float *y, const float *x, const void *W, int wdt,
                           int in, int out)
 {
+#ifdef K3_CUDA
+    if (wdt == K3_WBF16 && k3_cuda_enabled() &&
+        k3_cuda_matmul_bf16(y, x, (const uint16_t *)W, in, out) == 0)
+        return;
+#endif
     if (wdt == K3_WBF16) k3_matmul_bf16(y, x, (const uint16_t *)W, in, out);
     else                 k3_matmul(y, x, (const float *)W, in, out);
 }

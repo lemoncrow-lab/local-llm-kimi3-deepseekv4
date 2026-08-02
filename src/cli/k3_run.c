@@ -1,3 +1,4 @@
+/* Modified 2026-08: CUDA, top-k, layer mapping, and warm-cache controls. See MODIFICATIONS.md. */
 /* k3_run.c - run the REAL Kimi K3, all 93 layers, from the released checkpoint.
  *
  * WHAT THIS IS
@@ -147,9 +148,16 @@ static void usage(FILE *f)
 "  --incremental         carry KV cache and recurrent state between tokens\n"
 "  --tok DIR             directory with tiktoken.model and tokenizer_config.json\n"
 "\n"
+"compute:\n"
+"  --cuda                offload large BF16 and MXFP4 GEMVs to CUDA device 0\n"
+"  --topk N              compute only the top N routed experts (1..checkpoint top-k);\n"
+"                        this modifies the model and trades quality for speed\n"
+"\n"
 "diagnostics:\n"
 "  --config PATH         model config; defaults to <model_dir>/config.json\n"
-"  --layers N            bind only the first N layers (partial shard sets)\n"
+"  --layers N            bind only N layers (the first N unless --layer-spacing)\n"
+"  --layer-spacing       spread selected layers from 0 through 92; this modifies the\n"
+"                        model into a depth-pruned stack for practical local inference\n"
 "  --dump-logits PATH    write float32 logits for the first step\n"
 "  --dump-cache-trace D  write expert_hist.json and expert_trace.bin into D, for\n"
 "                        offline analysis with tools/sim_cache.py\n"
@@ -237,7 +245,9 @@ static double mem_available_bytes(void)
 typedef struct {
     K3LayerBind *lay;
     K3ModelBind  mb;
+    int         *layer_id;    /* logical slot -> source checkpoint layer */
     int          n_bound;
+    int          trunk_cached; /* compressed matrices + persistent vectors are warm */
     K3Trunk     *trunk;      /* non-NULL when the trunk is streamed rather than resident */
     /* Incremental decode state. Only MLA layers need a KV cache, so the 24 of them are
      * numbered densely rather than indexing all 93 and wasting 74% of the allocation. */
@@ -269,38 +279,62 @@ static int forward(Weights *w, const K3Cfg *c, K3Cache *cache, const int *ids, i
      * scratch every step and must be. */
     if (!w->kvc) memset(kstate, 0, kper * (size_t)w->n_bound * sizeof(float));
     int nb = 0;
-    for (int L = 0; L < w->n_bound; L++) {
-        /* Streaming: bring this layer in, and hint the next one so its read overlaps
-         * this layer's arithmetic. The order is fixed 0..92 every token, so the hint is
-         * never wrong. */
-        if (w->trunk) {
-            if (k3_trunk_bind(w->trunk, c, L, &w->lay[L]) != 0) {
-                fprintf(stderr, "trunk bind failed at layer %d\n", L);
+    for (int i = 0; i < w->n_bound; i++) {
+        const int source_L = w->layer_id ? w->layer_id[i] : i;
+#ifdef K3_CUDA
+        /* Ring slots are reused for different layers and can never be keyed by host
+         * address.  Pinned/resident layers are immutable, so their BF16 matrices may
+         * safely remain in VRAM across generated tokens. */
+        if (k3_cuda_enabled())
+            k3_cuda_set_cache_scope(source_L,
+                !w->trunk || source_L < w->trunk->npin ||
+                k3_cuda_compressed_cache());
+#endif
+        /* Once every matrix has a compressed CUDA/host-cache copy and every
+         * elementwise vector has persistent metadata, rebinding would only reread
+         * 108.81 GB of bytes that cannot affect the result. */
+        int need_trunk_bind = w->trunk != NULL;
+#ifdef K3_CUDA
+        if (need_trunk_bind && w->trunk_cached) need_trunk_bind = 0;
+#endif
+        /* Streaming: bring the selected source layer in, then hint the next selected
+         * source layer. Prefix and depth-spaced pruning share this same path. */
+        if (need_trunk_bind) {
+            if (k3_trunk_bind(w->trunk, c, source_L, &w->lay[i]) != 0) {
+                fprintf(stderr, "trunk bind failed at source layer %d\n", source_L);
                 return -1;
             }
-            k3_trunk_prefetch(w->trunk, L + 1);
+            if (i + 1 < w->n_bound)
+                k3_trunk_prefetch(w->trunk, w->layer_id ? w->layer_id[i + 1] : i + 1);
         }
-        /* Point this layer's MoE at the cache before use. Doing it here rather than at
-         * bind time keeps K3LayerBind independent of any particular cache. */
-        if (w->lay[L].lay.moe) {
-            w->lay[L].moe.src = &cache->src;
-            w->lay[L].moe.layer = L;
+        /* Expert files are indexed by checkpoint layer, while recurrent/KV state is
+         * compactly indexed by the logical pruned stack. */
+        if (w->lay[i].lay.moe) {
+            w->lay[i].moe.src = &cache->src;
+            w->lay[i].moe.layer = source_L;
         }
-        if (w->kvc && w->mla_slot[L] >= 0) {
+        if (w->kvc && w->mla_slot[i] >= 0) {
             const size_t kvper = (size_t)w->kv_cap * c->n_heads * (c->qk_nope + c->v_head);
             const size_t rpper = (size_t)w->kv_cap * c->qk_rope;
-            const int mi = w->mla_slot[L];
-            k3_decoder_layer_inc(h, br, &nb, &w->lay[L].lay, c, L, T,
-                                 kstate + kper * (size_t)L, scratch,
+            const int mi = w->mla_slot[i];
+            k3_decoder_layer_inc(h, br, &nb, &w->lay[i].lay, c, i, T,
+                                 kstate + kper * (size_t)i, scratch,
                                  w->kvc + kvper * (size_t)mi,
                                  w->ropec + rpper * (size_t)mi,
                                  w->cached, w->kv_cap);
         } else {
-            k3_decoder_layer_inc(h, br, &nb, &w->lay[L].lay, c, L, T,
-                                 kstate + kper * (size_t)L, scratch,
+            k3_decoder_layer_inc(h, br, &nb, &w->lay[i].lay, c, i, T,
+                                 kstate + kper * (size_t)i, scratch,
                                  NULL, NULL, 0, 0);
         }
     }
+
+#ifdef K3_CUDA
+    if (w->trunk && w->trunk->persist_meta && k3_cuda_compressed_complete())
+        w->trunk_cached = 1;
+    /* Model-level allocations, especially the 2.35 GB lm_head, are immutable. */
+    if (k3_cuda_enabled()) k3_cuda_set_cache_scope(-2, 1);
+#endif
 
     /* The model-level aggregator, beyond the two per layer. Exactly one pair exists in
      * the checkpoint; skipping it is silent. */
@@ -349,10 +383,10 @@ int main(int argc, char **argv)
     const char *logits_path = NULL;
     const char *prompt_text = NULL, *prompt_file = NULL, *tok_dir = NULL;
     const char *cfg_path = NULL;
-    int gen = 8, want_layers = -1;
+    int gen = 8, want_layers = -1, topk_override = 0;
     double cache_gb = 64.0, trunk_gb = 16.0;
     const char *preset_name = NULL;
-    int incremental = 0;
+    int incremental = 0, use_cuda = 0, layer_spacing = 0;
     for (int i = 2; i < argc; i++) {
         if (!strcmp(argv[i], "--ids") && i + 1 < argc) ids_s = argv[++i];
         else if (!strcmp(argv[i], "--prompt") && i + 1 < argc) prompt_text = argv[++i];
@@ -362,10 +396,13 @@ int main(int argc, char **argv)
         else if (!strcmp(argv[i], "--gen") && i + 1 < argc) gen = atoi(argv[++i]);
         else if (!strcmp(argv[i], "--cache-gb") && i + 1 < argc) cache_gb = atof(argv[++i]);
         else if (!strcmp(argv[i], "--layers") && i + 1 < argc) want_layers = atoi(argv[++i]);
+        else if (!strcmp(argv[i], "--layer-spacing")) layer_spacing = 1;
         else if (!strcmp(argv[i], "--out") && i + 1 < argc) outp = argv[++i];
         else if (!strcmp(argv[i], "--trunk") && i + 1 < argc) trunk_dir = argv[++i];
         else if (!strcmp(argv[i], "--trunk-gb") && i + 1 < argc) trunk_gb = atof(argv[++i]);
         else if (!strcmp(argv[i], "--incremental")) incremental = 1;
+        else if (!strcmp(argv[i], "--cuda")) use_cuda = 1;
+        else if (!strcmp(argv[i], "--topk") && i + 1 < argc) topk_override = atoi(argv[++i]);
         else if (!strcmp(argv[i], "--dump-logits") && i + 1 < argc) logits_path = argv[++i];
         else if (!strcmp(argv[i], "--dump-cache-trace") && i + 1 < argc) trace_dir = argv[++i];
         else if (!strcmp(argv[i], "--preset") && i + 1 < argc) {
@@ -410,10 +447,41 @@ int main(int argc, char **argv)
         fprintf(stderr, "ABORTED: the model config could not be read with confidence.\n");
         return 2;
     }
+    if (topk_override) {
+        if (topk_override < 1 || topk_override > c.topk) {
+            fprintf(stderr, "--topk must be between 1 and the checkpoint value %d\n", c.topk);
+            return 2;
+        }
+        if (topk_override != c.topk)
+            printf("NOTE: routed top-k reduced from %d to %d. This MODIFIES the model; "
+                   "quality is not checkpoint-equivalent.\n\n", c.topk, topk_override);
+        c.topk = topk_override;
+    }
+    if (use_cuda) {
+#ifdef K3_CUDA
+        if (k3_cuda_init(0) != 0) {
+            fprintf(stderr, "CUDA initialisation failed\n");
+            return 1;
+        }
+#else
+        fprintf(stderr, "--cuda requires bin/k3-cuda (run make cuda)\n");
+        return 2;
+#endif
+    }
+    if (layer_spacing && !(want_layers > 0 && want_layers < c.n_layers)) {
+        fprintf(stderr, "--layer-spacing requires --layers N with 1 <= N < %d\n",
+                c.n_layers);
+        return 2;
+    }
     if (want_layers > 0 && want_layers < c.n_layers) {
-        printf("NOTE: binding only the first %d of %d layers. Output is NOT the full "
-               "model; it is a partial stack for testing the machinery.\n\n",
-               want_layers, c.n_layers);
+        if (layer_spacing)
+            printf("NOTE: selecting %d depth-spaced layers from the %d-layer checkpoint. "
+                   "This MODIFIES the model; quality is not checkpoint-equivalent.\n\n",
+                   want_layers, c.n_layers);
+        else
+            printf("NOTE: binding only the first %d of %d layers. Output is NOT the full "
+                   "model; it is a partial stack for testing the machinery.\n\n",
+                   want_layers, c.n_layers);
     }
 
     /* ---- prompt ----
@@ -510,6 +578,8 @@ int main(int argc, char **argv)
 
     char b1[32];
     printf("Kimi K3, pure C, released checkpoint\n");
+    printf("  compute  : %s\n", use_cuda ? "CUDA offload" : "CPU");
+    printf("  routed k : %d\n", c.topk);
     printf("  shards   : %s\n", dir);
     printf("  prompt   : %d tokens, generating %d\n", np, gen);
     /* Echo the preset so a captured log is self-describing: a timing figure is
@@ -527,9 +597,21 @@ int main(int argc, char **argv)
     /* ---- how much will this take? Report BEFORE allocating, so a box that cannot
      * hold it fails with a number rather than an OOM kill. ---- */
     const int NL = (want_layers > 0 && want_layers < c.n_layers) ? want_layers : c.n_layers;
+    int *layer_ids = (int *)malloc((size_t)NL * sizeof(int));
+    if (!layer_ids) return 1;
+    for (int i = 0; i < NL; i++) {
+        layer_ids[i] = layer_spacing && NL > 1
+            ? (i * (c.n_layers - 1) + (NL - 1) / 2) / (NL - 1)
+            : i;
+    }
+    if (layer_spacing) {
+        printf("  source layers:");
+        for (int i = 0; i < NL; i++) printf(" %d", layer_ids[i]);
+        printf("\n");
+    }
     int64_t total = 0; int missing = 0;
-    for (int L = 0; L < NL; L++) {
-        const int64_t n = k3_bind_layer_bytes(&st, &c, L);
+    for (int i = 0; i < NL; i++) {
+        const int64_t n = k3_bind_layer_bytes(&st, &c, layer_ids[i]);
         if (n < 0) { missing++; continue; }
         total += n;
     }
@@ -606,6 +688,7 @@ int main(int argc, char **argv)
     }
 
     Weights w; memset(&w, 0, sizeof w);
+    w.layer_id = layer_ids;
     w.lay = (K3LayerBind *)calloc((size_t)NL, sizeof(K3LayerBind));
     if (!w.lay) return 1;
 
@@ -618,21 +701,23 @@ int main(int argc, char **argv)
          * matters because the K3 report (4.1.4) keeps exactly these tensors in higher
          * precision on purpose. */
         if (k3_trunk_open(&trunk, trunk_dir, &c, (int64_t)(trunk_gb * 1e9)) != 0) return 1;
-        if (trunk.n_layers < NL) {
-            fprintf(stderr, "packed trunk has %d layers, need %d\n", trunk.n_layers, NL);
+        if (trunk.n_layers <= layer_ids[NL - 1]) {
+            fprintf(stderr, "packed trunk has %d layers, selected source layer %d\n",
+                    trunk.n_layers, layer_ids[NL - 1]);
             return 1;
         }
         w.trunk = &trunk;
         w.n_bound = NL;
         printf("trunk streaming enabled from %s in %.1f s\n", trunk_dir, now_s() - t0);
     } else {
-        for (int L = 0; L < NL; L++) {
-            if (k3_bind_layer(&st, &c, L, &w.lay[L]) != 0) {
-                fprintf(stderr, "bind failed at layer %d\n", L); return 1;
+        for (int i = 0; i < NL; i++) {
+            const int source_L = layer_ids[i];
+            if (k3_bind_layer(&st, &c, source_L, &w.lay[i]) != 0) {
+                fprintf(stderr, "bind failed at source layer %d\n", source_L); return 1;
             }
-            w.n_bound = L + 1;
-            if ((L + 1) % 10 == 0 || L + 1 == NL) {
-                printf("  bound %d/%d layers, %.1f s elapsed\n", L + 1, NL, now_s() - t0);
+            w.n_bound = i + 1;
+            if ((i + 1) % 10 == 0 || i + 1 == NL) {
+                printf("  bound %d/%d layers, %.1f s elapsed\n", i + 1, NL, now_s() - t0);
                 fflush(stdout);
             }
         }
@@ -717,8 +802,8 @@ int main(int argc, char **argv)
         w.mla_slot = (int *)malloc((size_t)NL * sizeof(int));
         if (!w.mla_slot) return 1;
         w.n_mla = 0;
-        for (int L = 0; L < NL; L++)
-            w.mla_slot[L] = k3_is_mla(&c, L) ? w.n_mla++ : -1;
+        for (int i = 0; i < NL; i++)
+            w.mla_slot[i] = k3_is_mla(&c, layer_ids[i]) ? w.n_mla++ : -1;
         w.kv_cap = Tmax;
         const size_t kvper = (size_t)w.kv_cap * c.n_heads * (c.qk_nope + c.v_head);
         const size_t rpper = (size_t)w.kv_cap * c.qk_rope;
@@ -825,7 +910,9 @@ int main(int argc, char **argv)
         for (int i = 0; i < nout; i++) fprintf(f, "%s%d", i ? "," : "", outtok[i]);
         fprintf(f, "],\"full_ids\":[");
         for (int i = 0; i < T; i++) fprintf(f, "%s%d", i ? "," : "", seq[i]);
-        fprintf(f, "],\"layers\":%d,\"seconds_per_token\":%.4f}\n", NL, t_total / nout);
+        fprintf(f, "],\"layers\":%d,\"source_layers\":[", NL);
+        for (int i = 0; i < NL; i++) fprintf(f, "%s%d", i ? "," : "", layer_ids[i]);
+        fprintf(f, "],\"seconds_per_token\":%.4f}\n", t_total / nout);
         fclose(f);
         printf("\nwrote %s\n", outp);
     }
@@ -879,9 +966,16 @@ int main(int argc, char **argv)
     k3_cache_free(&cache);
     for (int L = 0; L < w.n_bound; L++) k3_bind_free(&w.lay[L]);
     free(w.lay);
+    free(w.layer_id);
     k3_bind_model_free(&w.mb);
     k3_st_close(&st);
     free(h); free(br); free(ks); free(sc); free(lg);
+#ifdef K3_CUDA
+    if (use_cuda) {
+        k3_cuda_report();
+        k3_cuda_shutdown();
+    }
+#endif
 
     /* A dropped expert means some token was computed with part of its routed sum
      * missing. The run still produced token ids and they still look plausible, which is
