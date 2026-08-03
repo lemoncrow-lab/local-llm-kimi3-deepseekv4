@@ -294,6 +294,111 @@ def completions(req: CompletionRequest):
     return _run(ENGINE.tok.encode(req.prompt), req, chat=False)
 
 
+# ------------------------------------------------------------ anthropic /v1/messages
+# Claude Code and the other Anthropic-native CLIs speak this instead of the OpenAI
+# schema.  The wire format differs (content blocks, named SSE events); the engine and
+# the checkpoint's own chat template are shared with the OpenAI path above.
+class AnthropicRequest(BaseModel):
+    model: str = MODEL_ID
+    messages: List[Dict[str, Any]]
+    system: Optional[Union[str, List[Dict[str, Any]]]] = None
+    max_tokens: int = 4096
+    temperature: float = 0.2
+    stream: bool = False
+    stop_sequences: Optional[List[str]] = None
+    tools: Optional[List[Dict[str, Any]]] = None
+
+
+def _flatten(content):
+    """Anthropic content blocks -> the plain text the DeepSeek template expects."""
+    if content is None or isinstance(content, str):
+        return content or ""
+    out = []
+    for b in content:
+        if not isinstance(b, dict):
+            out.append(str(b))
+        elif b.get("type") == "text":
+            out.append(b.get("text", ""))
+        elif b.get("type") == "tool_result":
+            out.append(_flatten(b.get("content")))
+        elif b.get("type") == "tool_use":
+            out.append(json.dumps({"name": b.get("name"), "arguments": b.get("input")}))
+    return "\n".join(x for x in out if x)
+
+
+def _anthropic_msgs(req):
+    msgs = []
+    sys_txt = _flatten(req.system)
+    if sys_txt:
+        msgs.append({"role": "system", "content": sys_txt})
+    for m in req.messages:
+        msgs.append({"role": m.get("role", "user"),
+                     "content": _flatten(m.get("content"))})
+    # encoding_dsv4 wants OpenAI-shaped tools; Anthropic puts the schema in input_schema
+    tools = [{"type": "function",
+              "function": {"name": t.get("name"), "description": t.get("description", ""),
+                           "parameters": t.get("input_schema", {})}}
+             for t in (req.tools or [])] or None
+    return msgs, tools
+
+
+@app.post("/v1/messages")
+def messages_endpoint(req: AnthropicRequest):
+    msgs, tools = _anthropic_msgs(req)
+    ids = ENGINE.tok.encode(ENGINE.render(msgs, tools=tools))
+    stop = list(req.stop_sequences or [])
+    gen = ENGINE.generate(ids, req.max_tokens, req.temperature, stop)
+    mid = "msg_" + uuid.uuid4().hex[:24]
+
+    if not req.stream:
+        text, n = "", 0
+        for _, text in gen:
+            n += 1
+        hit = next((s for s in stop if s and text.endswith(s)), None)
+        if hit:
+            text = text[: -len(hit)]
+        return {"id": mid, "type": "message", "role": "assistant", "model": MODEL_ID,
+                "content": [{"type": "text", "text": text}],
+                "stop_reason": "stop_sequence" if hit else
+                               ("max_tokens" if n >= req.max_tokens else "end_turn"),
+                "stop_sequence": hit,
+                "usage": {"input_tokens": len(ids), "output_tokens": n}}
+
+    def ev(name, data):
+        return f"event: {name}\ndata: {json.dumps(data)}\n\n"
+
+    def sse():
+        yield ev("message_start", {"type": "message_start", "message": {
+            "id": mid, "type": "message", "role": "assistant", "model": MODEL_ID,
+            "content": [], "stop_reason": None, "stop_sequence": None,
+            "usage": {"input_tokens": len(ids), "output_tokens": 0}}})
+        yield ev("content_block_start", {"type": "content_block_start", "index": 0,
+                                         "content_block": {"type": "text", "text": ""}})
+        prev, n = "", 0
+        for _, text in gen:
+            delta, prev = text[len(prev):], text
+            if not delta:
+                continue
+            n += 1
+            yield ev("content_block_delta", {"type": "content_block_delta", "index": 0,
+                                             "delta": {"type": "text_delta", "text": delta}})
+        yield ev("content_block_stop", {"type": "content_block_stop", "index": 0})
+        yield ev("message_delta", {"type": "message_delta",
+                                   "delta": {"stop_reason": "end_turn", "stop_sequence": None},
+                                   "usage": {"output_tokens": n}})
+        yield ev("message_stop", {"type": "message_stop"})
+
+    return StreamingResponse(sse(), media_type="text/event-stream",
+                             headers={"Cache-Control": "no-cache",
+                                      "X-Accel-Buffering": "no"})
+
+
+@app.post("/v1/messages/count_tokens")
+def count_tokens(req: AnthropicRequest):
+    msgs, tools = _anthropic_msgs(req)
+    return {"input_tokens": len(ENGINE.tok.encode(ENGINE.render(msgs, tools=tools)))}
+
+
 def main():
     ap = argparse.ArgumentParser()
     ap.add_argument("--host", default=os.environ.get("DSV4_HOST", "127.0.0.1"))

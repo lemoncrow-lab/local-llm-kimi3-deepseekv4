@@ -227,6 +227,30 @@ OpenAI-compatible, so any client works — point it at `http://127.0.0.1:8000/v1
 through to the checkpoint's own DSML tool-call format), `POST /v1/completions`,
 `GET /v1/models`, `GET /health`.
 
+### Pointing coding agents at it
+
+The server speaks both wire formats, so the OpenAI-native and Anthropic-native CLIs
+both work unchanged: `POST /v1/messages` (+ `/v1/messages/count_tokens`) shares the
+engine and the chat template with `/v1/chat/completions`, differing only in the
+content-block schema and the named SSE events.
+
+```bash
+# Claude Code
+ANTHROPIC_BASE_URL=http://127.0.0.1:8000 ANTHROPIC_AUTH_TOKEN=local \
+ANTHROPIC_MODEL=deepseek-v4-flash claude
+
+# Codex CLI -- ~/.codex/config.toml
+#   model = "deepseek-v4-flash"
+#   model_provider = "dsv4"
+#   [model_providers.dsv4]
+#   name = "dsv4"
+#   base_url = "http://127.0.0.1:8000/v1"
+#   wire_api = "chat"                       # not the Responses API
+```
+
+Temper expectations: at ~4.5 tok/s a 600-token patch is ~2 minutes, and every tool
+result re-prefills unless it extends the previous state exactly.
+
 Only the *engine* is hand-written, and only because it has to be: the checkpoint declares
 `DeepseekV4ForCausalLM` with no `auto_map`, so transformers cannot load it, and no
 vLLM / SGLang / llama.cpp build has that architecture (hyper-connections, Sinkhorn
