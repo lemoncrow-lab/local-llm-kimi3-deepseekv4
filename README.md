@@ -36,29 +36,14 @@ The first forward pass reads and packs the 108.81 GB trunk: measured warm-up is 
 ~44 s for a 28-token prompt in fast mode (69.11 s before). Later tokens in the same
 process perform zero trunk reads. The cache is still lost when the process exits.
 
-## Also here: DeepSeek-V4-Flash-0731 on the same 4090
+## Related: DeepSeek-V4-Flash-0731 on the same 4090
 
-`deepseek-v4-flash/` is a second, unrelated runner in this repository — same box, same
-constraint, different model and a different technique. It runs the released checkpoint
-at **full precision** (fp4 e2m1 routed experts, fp8 e4m3 trunk, exactly as shipped, with
-output token ids identical to the reference implementation) by streaming the ~140 GiB
-expert pool from NVMe through a two-level VRAM + pinned-RAM LRU cache.
-
-| | |
-|---|---:|
-| steady decode, batch 1 | **~4.5 tok/s** (0.35 tok/s before optimisation) |
-| precision | released fp4/fp8 — no requantisation |
-| resident in VRAM | 7.8 GiB trunk + KV; experts stream |
-
-It works because routing is skewed: over a real trace only 28.4% of the 11 008
-(layer, expert) pairs are ever touched and the hottest 5% serve 32% of accesses, so most
-of the 3.21 GiB a token needs is already cached. The rest is a fused grouped fp4 GEMM
-that unpacks e2m1 in registers, and triton replacements for the Sinkhorn router,
-activation quantisation and fp8 GEMM (26 460 → 6 357 kernel launches per token).
-
-There is also a persistent OpenAI **and** Anthropic compatible server, so Claude Code
-and Codex CLI can be pointed at it. See
-[deepseek-v4-flash/README.md](deepseek-v4-flash/README.md).
+A second runner for the same box, in its own repository:
+[lemoncrow-lab/local-llm-deepseek-v4-flash](https://github.com/lemoncrow-lab/local-llm-deepseek-v4-flash).
+It runs the released checkpoint at **full precision** (fp4 e2m1 experts, fp8 e4m3 trunk,
+output token ids identical to the reference) at **~4.5 tok/s**, by streaming the ~140 GiB
+expert pool from NVMe through a two-level VRAM + pinned-RAM cache instead of quantising
+it down. Different model, different technique, no shared code — hence the separate repo.
 
 ## What changed
 
