@@ -55,7 +55,7 @@ SLAB_EXPERTS = (8 << 30) // EXPERT_B
 class ExpertStream:
     # left free for cuBLAS/triton workspaces, prefill activations and fragmentation.
     # cublasCreate() fails with ALLOC_FAILED if the cache eats into this.
-    VRAM_RESERVE = 2.5 * (1 << 30)
+    VRAM_RESERVE = float(os.environ.get("DSV4_VRAM_RESERVE_GIB", 2.5)) * (1 << 30)
 
     def __init__(self, w, vram_gib=0.0, ram_gib=24.0, threads=32, split=1 << 20,
                  max_experts=64, device="cuda"):
