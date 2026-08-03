@@ -3,6 +3,71 @@
 Measured 2026-08-02 on this box (i9-14900K, 125 GiB RAM, 32 GiB swap, RTX 4090 24 GB,
 FireCuda 530 NVMe). All numbers below are measured, not estimated, except where marked.
 
+## What this is
+
+A runner for the released `DeepSeek-V4-Flash-0731` checkpoint on a single 24 GB GPU, at
+the precision it shipped in — fp4 e2m1 routed experts, fp8 e4m3 trunk, no requantisation
+— reaching **~4.5 tok/s** by streaming the expert pool from NVMe instead of shrinking it.
+
+It exists because nothing else loads this checkpoint: `config.json` declares
+`DeepseekV4ForCausalLM` with no `auto_map`, so transformers cannot build it, and no
+vLLM / SGLang / llama.cpp build has that architecture either. Only the engine is
+hand-written; FastAPI, uvicorn, triton and the checkpoint's own `encoding_dsv4` do
+everything above it.
+
+```
+dsv4/run.py          CLI: loads the trunk, installs the streaming MoE, generates
+dsv4/serve.py        persistent OpenAI + Anthropic compatible server
+dsv4/stream.py       two-level VRAM + pinned-RAM expert cache, pread/DMA loader
+dsv4/fp4_triton.py   fused grouped fp4 e2m1 GEMM (unpacks in registers)
+dsv4/tk.py           triton Sinkhorn router, act_quant, fp8 GEMM
+dsv4/kernels_torch.py  reference torch implementations the triton ones are checked against
+dsv4/test_*.py       correctness tests, all asserting on relative error
+run-dsv4-4090.sh     one-shot CLI wrapper (forwards to the server if one is up)
+serve-dsv4-4090.sh   server wrapper
+```
+
+## Requirements
+
+* NVIDIA GPU with **>= 20 GB** VRAM (7.8 GiB trunk + KV + expert cache; measured on a 4090)
+* **>= 64 GB** RAM — 48 GiB of it is pinned for the host expert cache by default
+* the checkpoint on a fast NVMe (155 GiB; a SATA SSD roughly halves the rate)
+* python 3.12+, torch 2.12 with CUDA, triton, transformers, fastapi, uvicorn
+
+## Quick start
+
+```bash
+# 1. weights (155 GiB) -- accept the licence on the model page first
+huggingface-cli download deepseek-ai/DeepSeek-V4-Flash-0731 --local-dir ./DeepSeek-V4-Flash-0731
+
+# 2. environment
+python -m venv .venv-dsv4 && .venv-dsv4/bin/pip install \
+    torch --index-url https://download.pytorch.org/whl/cu129
+.venv-dsv4/bin/pip install triton transformers fastapi uvicorn
+
+# 3. tell the scripts where both live (defaults assume they sit next to them)
+export DSV4_MODEL=$PWD/DeepSeek-V4-Flash-0731
+export DSV4_PYTHON=$PWD/.venv-dsv4/bin/python
+
+# 4. one-shot
+./run-dsv4-4090.sh --chat 'write fizzbuzz in rust'
+
+# 5. or leave it resident -- worth far more here than for a normal model
+./serve-dsv4-4090.sh                       # 127.0.0.1:8000
+curl -N localhost:8000/v1/chat/completions -H 'content-type: application/json' \
+  -d '{"messages":[{"role":"user","content":"write fizzbuzz"}],"stream":true}'
+```
+
+With the server up, `run-dsv4-4090.sh` forwards to it automatically (`DSV4_NO_SERVER=1`
+opts out) — the GPU fits exactly one copy of the trunk, so the two cannot coexist.
+
+Verify the kernels against the torch reference at any time:
+
+```bash
+cd dsv4 && ../.venv-dsv4/bin/python test_kernels_torch.py && \
+  ../.venv-dsv4/bin/python test_tk.py && ../.venv-dsv4/bin/python test_fp4_triton.py
+```
+
 ## The checkpoint
 
 155.42 GiB, 48 shards, 43 layers + 3 MTP (DSpark speculative) blocks.
